@@ -1,15 +1,16 @@
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from openai import OpenAI
 import pandas as pd
 
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 📰 NEWS (Yahoo RSS)
+# 📰 NEWS
 def fetch_news():
     url = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=spy,qqq,aapl,msft,nvda,tsla&region=US&lang=en-US"
     r = requests.get(url).text
@@ -25,24 +26,42 @@ def fetch_news():
     return headlines
 
 
-# 📊 MARKET DATA
-def get_quote(ticker):
+# 📊 POLYGON DAILY CLOSE
+def get_polygon_close(ticker, date):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}?adjusted=true&apiKey={POLYGON_API_KEY}"
     try:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
         r = requests.get(url).json()
-        q = r["quoteResponse"]["result"][0]
-        return round(q.get("regularMarketChangePercent", 0), 2)
+        return r["results"][0]["c"]
+    except:
+        return None
+
+
+def get_change(ticker):
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    prev = today - timedelta(days=2)
+
+    try:
+        close_today = get_polygon_close(ticker, yesterday)
+        close_prev = get_polygon_close(ticker, prev)
+
+        if close_today is None or close_prev is None:
+            return 0
+
+        change = ((close_today - close_prev) / close_prev) * 100
+        return round(change, 2)
+
     except:
         return 0
 
 
+# 📊 MARKET DATA
 def fetch_market():
     tickers = {
         "SPY": "Market",
         "QQQ": "Tech",
-        "VIX": "Volatility",
-        "^TNX": "Rates",
-        "CL=F": "Oil",
+        "UVXY": "Volatility",
+        "USO": "Oil",
         "XLE": "Energy",
         "XLK": "TechSector",
         "XLF": "Financials"
@@ -50,20 +69,20 @@ def fetch_market():
 
     data = {}
     for t in tickers:
-        data[t] = get_quote(t)
+        data[t] = get_change(t)
 
     return data
 
 
-# 🧮 MARKET SCORE
-def compute_score(market):
+# 🧮 SCORE
+def compute_score(m):
     score = 5
 
-    if market["SPY"] > 0: score += 1
-    if market["QQQ"] > 0: score += 1
-    if market["VIX"] < 0: score += 1
-    if market["^TNX"] < 0: score += 1
-    if market["CL=F"] < 0: score += 1
+    if m["SPY"] > 0: score += 1
+    if m["QQQ"] > 0: score += 1
+    if m["UVXY"] < 0: score += 1  # volatilité baisse = positif
+    if m["USO"] < 0: score += 1  # pétrole baisse = positif
+    if m["XLF"] > 0: score += 1
 
     return max(1, min(score, 10))
 
@@ -76,18 +95,19 @@ def regime(score):
     return "NEUTRAL"
 
 
-# 📈 TOP MOVERS (S&P500 sample)
+# 📈 SP500
 def fetch_sp500():
     df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
-    return df["Symbol"].tolist()[:100]  # pour vitesse
+    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
 
 def top_movers():
-    tickers = fetch_sp500()
+    tickers = fetch_sp500()[:100]  # rapide
+
     results = []
 
     for t in tickers:
-        change = get_quote(t)
+        change = get_change(t)
         results.append((t, change))
 
     df = pd.DataFrame(results, columns=["ticker", "change"])
@@ -96,30 +116,24 @@ def top_movers():
     return df.head(5), df.tail(5)
 
 
-# 🧠 GPT ANALYSIS
-def generate_recap(news, market, score, regime, top, worst):
+# 🧠 GPT
+def generate_recap(news, market, score, reg, top, worst):
 
     news_text = "\n".join(news)
     market_text = "\n".join([f"{k}: {v}%" for k, v in market.items()])
-
     top_text = "\n".join([f"{r.ticker}: {r.change}%" for _, r in top.iterrows()])
     worst_text = "\n".join([f"{r.ticker}: {r.change}%" for _, r in worst.iterrows()])
 
     prompt = f"""
-Create a SHORT hedge fund style market recap.
+Create a SHORT hedge fund style recap.
 
 Tone:
-- Like Liz Ann Sonders + Bloomberg terminal
+- Bloomberg terminal
 - Light but sharp
 - No emojis
 
-Structure:
-1. Macro & Geopolitics (priority)
-2. Market behavior (use data)
-3. Key stocks / sectors
-
 Market Score: {score}/10
-Regime: {regime}
+Regime: {reg}
 
 Market Data:
 {market_text}
@@ -133,11 +147,11 @@ Worst Movers:
 News:
 {news_text}
 
-Format EXACTLY:
+Format EXACT:
 
 🟫 TEA ELITE // DAILY RECAP
 DATE: {datetime.now().strftime("%Y-%m-%d")}
-MODE: {regime}
+MODE: {reg}
 SCORE: {score}/10
 
 ━━━━━━━━━━━━━━━━━━━
@@ -171,6 +185,7 @@ def send_discord(msg):
 def main():
     news = fetch_news()
     market = fetch_market()
+
     score = compute_score(market)
     reg = regime(score)
 
