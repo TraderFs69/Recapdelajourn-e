@@ -2,25 +2,22 @@ import requests
 import os
 from datetime import datetime
 from openai import OpenAI
+import pandas as pd
 
-# 🔑 KEYS
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 📰 FETCH NEWS (Yahoo Finance RSS)
+# 📰 NEWS (Yahoo RSS)
 def fetch_news():
-    url = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=spy,aapl,msft,nvda,tsla&region=US&lang=en-US"
-    
-    r = requests.get(url)
-    text = r.text
+    url = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=spy,qqq,aapl,msft,nvda,tsla&region=US&lang=en-US"
+    r = requests.get(url).text
 
     headlines = []
+    parts = r.split("<title>")
 
-    # extraction simple des titres RSS
-    parts = text.split("<title>")
-    for p in parts[2:15]:  # skip first junk + limit
+    for p in parts[2:15]:
         title = p.split("</title>")[0]
         if len(title) > 20:
             headlines.append(title)
@@ -28,59 +25,120 @@ def fetch_news():
     return headlines
 
 
-# 📊 FETCH MARKET DATA (Yahoo)
-def fetch_market_data():
-    tickers = ["SPY", "QQQ", "XLE", "XLF"]
+# 📊 MARKET DATA
+def get_quote(ticker):
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+        r = requests.get(url).json()
+        q = r["quoteResponse"]["result"][0]
+        return round(q.get("regularMarketChangePercent", 0), 2)
+    except:
+        return 0
+
+
+def fetch_market():
+    tickers = {
+        "SPY": "Market",
+        "QQQ": "Tech",
+        "VIX": "Volatility",
+        "^TNX": "Rates",
+        "CL=F": "Oil",
+        "XLE": "Energy",
+        "XLK": "TechSector",
+        "XLF": "Financials"
+    }
 
     data = {}
-
     for t in tickers:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={t}"
-        try:
-            r = requests.get(url).json()
-            quote = r["quoteResponse"]["result"][0]
-            change = quote.get("regularMarketChangePercent", 0)
-            data[t] = round(change, 2)
-        except:
-            data[t] = 0
+        data[t] = get_quote(t)
 
     return data
 
 
-# 🧠 GPT ANALYSIS (STYLE TEA)
-def generate_recap(headlines, market_data):
+# 🧮 MARKET SCORE
+def compute_score(market):
+    score = 5
 
-    news_text = "\n".join(headlines)
+    if market["SPY"] > 0: score += 1
+    if market["QQQ"] > 0: score += 1
+    if market["VIX"] < 0: score += 1
+    if market["^TNX"] < 0: score += 1
+    if market["CL=F"] < 0: score += 1
 
-    market_text = "\n".join([f"{k}: {v}%" for k, v in market_data.items()])
+    return max(1, min(score, 10))
+
+
+def regime(score):
+    if score >= 7:
+        return "RISK-ON"
+    elif score <= 4:
+        return "RISK-OFF"
+    return "NEUTRAL"
+
+
+# 📈 TOP MOVERS (S&P500 sample)
+def fetch_sp500():
+    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
+    return df["Symbol"].tolist()[:100]  # pour vitesse
+
+
+def top_movers():
+    tickers = fetch_sp500()
+    results = []
+
+    for t in tickers:
+        change = get_quote(t)
+        results.append((t, change))
+
+    df = pd.DataFrame(results, columns=["ticker", "change"])
+    df = df.sort_values("change", ascending=False)
+
+    return df.head(5), df.tail(5)
+
+
+# 🧠 GPT ANALYSIS
+def generate_recap(news, market, score, regime, top, worst):
+
+    news_text = "\n".join(news)
+    market_text = "\n".join([f"{k}: {v}%" for k, v in market.items()])
+
+    top_text = "\n".join([f"{r.ticker}: {r.change}%" for _, r in top.iterrows()])
+    worst_text = "\n".join([f"{r.ticker}: {r.change}%" for _, r in worst.iterrows()])
 
     prompt = f"""
-You are a macro strategist like Liz Ann Sonders with a light, punchy tone.
+Create a SHORT hedge fund style market recap.
 
-Create a SHORT market recap.
+Tone:
+- Like Liz Ann Sonders + Bloomberg terminal
+- Light but sharp
+- No emojis
 
 Structure:
-1. Macro & Geopolitics (MOST IMPORTANT)
-2. Market behavior (use SPY, QQQ, sectors)
-3. Key stocks / themes
+1. Macro & Geopolitics (priority)
+2. Market behavior (use data)
+3. Key stocks / sectors
 
-Rules:
-- Keep it SHORT
-- Only IMPORTANT info
-- Bloomberg terminal style
-- No emojis
+Market Score: {score}/10
+Regime: {regime}
 
 Market Data:
 {market_text}
 
+Top Movers:
+{top_text}
+
+Worst Movers:
+{worst_text}
+
 News:
 {news_text}
 
-Output format EXACTLY like:
+Format EXACTLY:
 
-🟫 TEA // DAILY RECAP
+🟫 TEA ELITE // DAILY RECAP
 DATE: {datetime.now().strftime("%Y-%m-%d")}
-MODE: ...
+MODE: {regime}
+SCORE: {score}/10
 
 ━━━━━━━━━━━━━━━━━━━
 MACRO / GEO
@@ -91,31 +149,34 @@ MARKET
 ...
 
 ━━━━━━━━━━━━━━━━━━━
-KEY MOVES
+FLOW / LEADERS
 ...
 """
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
+        temperature=0.6,
     )
 
     return response.choices[0].message.content
 
 
 # 📤 DISCORD
-def send_discord(message):
-    data = {"content": f"```{message}```"}
-    requests.post(DISCORD_WEBHOOK_URL, json=data)
+def send_discord(msg):
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": f"```{msg}```"})
 
 
 # 🚀 MAIN
 def main():
-    headlines = fetch_news()
-    market_data = fetch_market_data()
+    news = fetch_news()
+    market = fetch_market()
+    score = compute_score(market)
+    reg = regime(score)
 
-    recap = generate_recap(headlines, market_data)
+    top, worst = top_movers()
+
+    recap = generate_recap(news, market, score, reg, top, worst)
     send_discord(recap)
 
 
