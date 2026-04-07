@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timedelta
 from openai import OpenAI
 import pandas as pd
+import numpy as np
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -16,9 +17,7 @@ def fetch_news():
     r = requests.get(url).text
 
     headlines = []
-    parts = r.split("<title>")
-
-    for p in parts[2:15]:
+    for p in r.split("<title>")[2:15]:
         title = p.split("</title>")[0]
         if len(title) > 20:
             headlines.append(title)
@@ -26,7 +25,83 @@ def fetch_news():
     return headlines
 
 
-# 📊 POLYGON DAILY CLOSE
+# 📊 POLYGON DATA
+def get_closes(ticker, days=250):
+    end = datetime.now().date()
+    start = end - timedelta(days=days)
+
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&limit=5000&apiKey={POLYGON_API_KEY}"
+
+    try:
+        r = requests.get(url).json()
+        closes = [x["c"] for x in r["results"]]
+        return closes
+    except:
+        return []
+
+
+# 📊 EMA
+def ema(data, period):
+    return pd.Series(data).ewm(span=period).mean().iloc[-1]
+
+
+# 📊 BREADTH
+def compute_breadth(tickers):
+    above_50 = 0
+    above_200 = 0
+    total = 0
+
+    for t in tickers[:80]:  # limite pour vitesse
+        closes = get_closes(t)
+        if len(closes) < 200:
+            continue
+
+        last = closes[-1]
+        ema50 = ema(closes, 50)
+        ema200 = ema(closes, 200)
+
+        if last > ema50:
+            above_50 += 1
+        if last > ema200:
+            above_200 += 1
+
+        total += 1
+
+    if total == 0:
+        return 0, 0
+
+    return round(above_50 / total * 100, 1), round(above_200 / total * 100, 1)
+
+
+# 📊 SECTORS
+SECTORS = {
+    "XLK": "Tech",
+    "XLE": "Énergie",
+    "XLF": "Finance",
+    "XLV": "Santé",
+    "XLY": "Conso discrétionnaire",
+    "XLP": "Conso de base"
+}
+
+
+def get_change(ticker):
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    prev = today - timedelta(days=2)
+
+    try:
+        c1 = get_polygon_close(ticker, yesterday)
+        c2 = get_polygon_close(ticker, prev)
+
+        if c1 is None or c2 is None:
+            return 0
+
+        return round((c1 - c2) / c2 * 100, 2)
+
+    except:
+        return 0
+
+
 def get_polygon_close(ticker, date):
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}?adjusted=true&apiKey={POLYGON_API_KEY}"
     try:
@@ -36,53 +111,38 @@ def get_polygon_close(ticker, date):
         return None
 
 
-def get_change(ticker):
-    today = datetime.now().date()
-    yesterday = today - timedelta(days=1)
-    prev = today - timedelta(days=2)
+def sector_rotation():
+    scores = []
 
-    try:
-        close_today = get_polygon_close(ticker, yesterday)
-        close_prev = get_polygon_close(ticker, prev)
+    for t, name in SECTORS.items():
+        change = get_change(t)
+        scores.append((name, t, change))
 
-        if close_today is None or close_prev is None:
-            return 0
+    df = pd.DataFrame(scores, columns=["sector", "etf", "score"])
+    df = df.sort_values("score", ascending=False)
 
-        change = ((close_today - close_prev) / close_prev) * 100
-        return round(change, 2)
-
-    except:
-        return 0
+    return df.head(3)
 
 
-# 📊 MARKET DATA
+# 📊 MARKET CORE
 def fetch_market():
-    tickers = {
-        "SPY": "Market",
-        "QQQ": "Tech",
-        "UVXY": "Volatility",
-        "USO": "Oil",
-        "XLE": "Energy",
-        "XLK": "TechSector",
-        "XLF": "Financials"
+    return {
+        "SPY": get_change("SPY"),
+        "QQQ": get_change("QQQ"),
+        "UVXY": get_change("UVXY"),
+        "USO": get_change("USO")
     }
-
-    data = {}
-    for t in tickers:
-        data[t] = get_change(t)
-
-    return data
 
 
 # 🧮 SCORE
-def compute_score(m):
+def compute_score(m, breadth50):
     score = 5
 
     if m["SPY"] > 0: score += 1
     if m["QQQ"] > 0: score += 1
-    if m["UVXY"] < 0: score += 1  # volatilité baisse = positif
-    if m["USO"] < 0: score += 1  # pétrole baisse = positif
-    if m["XLF"] > 0: score += 1
+    if m["UVXY"] < 0: score += 1
+    if breadth50 > 60: score += 1
+    if breadth50 < 40: score -= 1
 
     return max(1, min(score, 10))
 
@@ -95,57 +155,29 @@ def regime(score):
     return "NEUTRAL"
 
 
-# 📈 SP500
-def fetch_sp500():
-    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
-    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
-
-
-def top_movers():
-    tickers = fetch_sp500()[:100]  # rapide
-
-    results = []
-
-    for t in tickers:
-        change = get_change(t)
-        results.append((t, change))
-
-    df = pd.DataFrame(results, columns=["ticker", "change"])
-    df = df.sort_values("change", ascending=False)
-
-    return df.head(5), df.tail(5)
-
-
-# 🧠 GPT
-def generate_recap(news, market, score, reg, top, worst):
-
-    news_text = "\n".join(news)
-    market_text = "\n".join([f"{k}: {v}%" for k, v in market.items()])
-    top_text = "\n".join([f"{r.ticker}: {r.change}%" for _, r in top.iterrows()])
-    worst_text = "\n".join([f"{r.ticker}: {r.change}%" for _, r in worst.iterrows()])
+# 🧠 GPT (FRANÇAIS)
+def generate_recap(news, market, breadth50, breadth200, sectors, score, reg):
 
     prompt = f"""
-Create a SHORT hedge fund style recap.
+Tu es un stratège macro style Liz Ann Sonders avec un ton léger.
 
-Tone:
-- Bloomberg terminal
-- Light but sharp
-- No emojis
+Fais un recap de marché COURT en français.
 
-Market Score: {score}/10
-Regime: {reg}
+Structure:
+1. Macro & géopolitique (priorité)
+2. Marché (indices + breadth)
+3. Rotation sectorielle
 
-Market Data:
-{market_text}
+Données:
+Marché: {market}
+Breadth EMA50: {breadth50}%
+Breadth EMA200: {breadth200}%
 
-Top Movers:
-{top_text}
-
-Worst Movers:
-{worst_text}
+Secteurs dominants:
+{sectors.to_string(index=False)}
 
 News:
-{news_text}
+{news}
 
 Format EXACT:
 
@@ -155,15 +187,15 @@ MODE: {reg}
 SCORE: {score}/10
 
 ━━━━━━━━━━━━━━━━━━━
-MACRO / GEO
+MACRO / GÉO
 ...
 
 ━━━━━━━━━━━━━━━━━━━
-MARKET
+MARCHÉ
 ...
 
 ━━━━━━━━━━━━━━━━━━━
-FLOW / LEADERS
+ROTATION
 ...
 """
 
@@ -186,12 +218,16 @@ def main():
     news = fetch_news()
     market = fetch_market()
 
-    score = compute_score(market)
+    sp500 = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")["Symbol"].tolist()
+
+    breadth50, breadth200 = compute_breadth(sp500)
+    sectors = sector_rotation()
+
+    score = compute_score(market, breadth50)
     reg = regime(score)
 
-    top, worst = top_movers()
+    recap = generate_recap(news, market, breadth50, breadth200, sectors, score, reg)
 
-    recap = generate_recap(news, market, score, reg, top, worst)
     send_discord(recap)
 
 
