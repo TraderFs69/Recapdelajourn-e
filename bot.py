@@ -1,252 +1,229 @@
+import pandas as pd
 import requests
 import os
 from datetime import datetime, timedelta
-from openai import OpenAI
-import pandas as pd
-import time
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# -----------------------------
+# LOAD SP500
+# -----------------------------
+def load_sp500():
+    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
+    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
-# =========================
-# 🔁 SAFE REQUEST
-# =========================
-def safe_request(url, retries=3):
-    for i in range(retries):
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except:
-            time.sleep(1)
-    return None
-
-
-# =========================
-# 📰 NEWS
-# =========================
-def fetch_news():
+# -----------------------------
+# FETCH DATA
+# -----------------------------
+def get_data(ticker, start, end):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=200&apiKey={POLYGON_API_KEY}"
     try:
-        url = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=spy,qqq,aapl,msft,nvda,tsla&region=US&lang=en-US"
-        text = requests.get(url, timeout=10).text
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if "results" not in data:
+            return None
 
-        headlines = []
-        for p in text.split("<title>")[2:12]:
-            title = p.split("</title>")[0]
-            if len(title) > 20:
-                headlines.append(title)
+        df = pd.DataFrame(data["results"])
+        df["Date"] = pd.to_datetime(df["t"], unit="ms")
+        df.set_index("Date", inplace=True)
 
-        return headlines
-    except:
-        return ["Aucune nouvelle majeure disponible"]
-
-
-# =========================
-# 📊 POLYGON CLOSE
-# =========================
-def get_polygon_close(ticker, date):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}?adjusted=true&apiKey={POLYGON_API_KEY}"
-    data = safe_request(url)
-
-    try:
-        return data["results"][0]["c"]
+        return df
     except:
         return None
 
+# -----------------------------
+# INDICATORS
+# -----------------------------
+def add_indicators(df):
+    df["EMA50"] = df["c"].ewm(span=50).mean()
+    df["EMA9"] = df["c"].ewm(span=9).mean()
+    df["EMA20"] = df["c"].ewm(span=20).mean()
+    df["RET"] = df["c"].pct_change()
+    return df
 
-# =========================
-# 📊 FALLBACK YAHOO
-# =========================
-def get_yahoo_change(ticker):
-    try:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-        r = requests.get(url, timeout=10).json()
-        q = r["quoteResponse"]["result"][0]
+# -----------------------------
+# BREADTH
+# -----------------------------
+def compute_breadth(tickers, start, end):
+    count = 0
+    valid = 0
 
-        price = q["regularMarketPrice"]
-        prev = q["regularMarketPreviousClose"]
-
-        return round((price - prev) / prev * 100, 2)
-    except:
-        return 0
-
-
-# =========================
-# 📊 CHANGE (POLYGON + FALLBACK)
-# =========================
-def get_change(ticker):
-    try:
-        today = datetime.now().date()
-        d1 = today - timedelta(days=1)
-        d2 = today - timedelta(days=2)
-
-        c1 = get_polygon_close(ticker, d1)
-        c2 = get_polygon_close(ticker, d2)
-
-        if c1 and c2:
-            return round((c1 - c2) / c2 * 100, 2)
-
-        # fallback
-        return get_yahoo_change(ticker)
-
-    except:
-        return 0
-
-
-# =========================
-# 📊 MARKET
-# =========================
-def fetch_market():
-    tickers = ["SPY", "QQQ", "UVXY", "USO"]
-    return {t: get_change(t) for t in tickers}
-
-
-# =========================
-# 📊 BREADTH (OPTIMISÉ)
-# =========================
-def compute_breadth(tickers):
-    above50 = 0
-    total = 0
-
-    for t in tickers[:30]:  # 🔥 réduit pour performance
-        url = f"https://api.polygon.io/v2/aggs/ticker/{t}/range/1/day/{datetime.now().date()-timedelta(days=200)}/{datetime.now().date()}?apiKey={POLYGON_API_KEY}"
-        data = safe_request(url)
-
-        try:
-            closes = [x["c"] for x in data["results"]]
-            if len(closes) < 50:
-                continue
-
-            ema50 = pd.Series(closes).ewm(span=50).mean().iloc[-1]
-
-            if closes[-1] > ema50:
-                above50 += 1
-
-            total += 1
-
-        except:
+    for t in tickers[:100]:  # rapide
+        df = get_data(t, start, end)
+        if df is None or len(df) < 50:
             continue
 
-    if total == 0:
-        return 50
+        df = add_indicators(df)
+        valid += 1
 
-    return round(above50 / total * 100, 1)
+        if df["c"].iloc[-1] > df["EMA50"].iloc[-1]:
+            count += 1
 
+    if valid == 0:
+        return 0
 
-# =========================
-# 📊 SECTORS
-# =========================
-SECTORS = ["XLK", "XLE", "XLF", "XLV", "XLY", "XLP"]
+    return round((count / valid) * 100, 1)
 
-def sector_rotation():
-    data = [(s, get_change(s)) for s in SECTORS]
-    df = pd.DataFrame(data, columns=["sector", "perf"])
-    return df.sort_values("perf", ascending=False).head(3)
+# -----------------------------
+# SNAPSHOT ETF
+# -----------------------------
+def get_snapshot():
+    assets = {
+        "SPY": "Equities",
+        "USO": "Oil",
+        "TLT": "Yields",
+        "UUP": "Dollar",
+        "GLD": "Gold"
+    }
 
+    changes = {}
 
-# =========================
-# 🧮 SCORE
-# =========================
-def compute_score(market, breadth):
-    score = 5
+    end_date = datetime.now() - timedelta(days=1)
+    start_date = end_date - timedelta(days=5)
 
-    if market["SPY"] > 0: score += 1
-    if market["QQQ"] > 0: score += 1
-    if market["UVXY"] < 0: score += 1
-    if breadth > 60: score += 1
-    if breadth < 40: score -= 1
+    start = start_date.strftime("%Y-%m-%d")
+    end = end_date.strftime("%Y-%m-%d")
 
-    return max(1, min(score, 10))
+    for t, name in assets.items():
+        df = get_data(t, start, end)
+        if df is None or len(df) < 2:
+            changes[name] = "?"
+            continue
 
+        ret = (df["c"].iloc[-1] / df["c"].iloc[-2] - 1) * 100
+        changes[name] = f"{round(ret,1)}%"
 
-def regime(score):
-    if score >= 7:
-        return "RISK-ON"
-    elif score <= 4:
-        return "RISK-OFF"
-    return "NEUTRAL"
+    return changes
 
+# -----------------------------
+# MARKET REGIME
+# -----------------------------
+def regime_text(breadth):
+    if breadth > 60:
+        return "bullish"
+    elif breadth > 40:
+        return "neutre"
+    else:
+        return "faible"
 
-# =========================
-# 🧠 GPT
-# =========================
-def generate_recap(news, market, breadth, sectors, score, reg):
+# -----------------------------
+# SCAN
+# -----------------------------
+def scan_market():
+    tickers = load_sp500()
 
-    prompt = f"""
-Tu es un stratège macro.
+    end_date = datetime.now() - timedelta(days=1)
+    start_date = end_date - timedelta(days=120)
 
-Fais un recap court en français style Bloomberg.
+    start = start_date.strftime("%Y-%m-%d")
+    end = end_date.strftime("%Y-%m-%d")
 
-Données:
-Marché: {market}
-Breadth: {breadth}%
-Secteurs: {sectors.to_string(index=False)}
-News: {news}
+    results = []
 
-Format:
+    for t in tickers[:150]:
+        df = get_data(t, start, end)
+        if df is None or len(df) < 50:
+            continue
 
-🟫 TEA ELITE // DAILY RECAP
-DATE: {datetime.now().strftime("%Y-%m-%d")}
-MODE: {reg}
-SCORE: {score}/10
+        df = add_indicators(df)
 
-━━━━━━━━━━━━━━━━━━━
-MACRO / GÉO
-...
+        last = df.iloc[-1]
+        score = 0
 
-━━━━━━━━━━━━━━━━━━━
-MARCHÉ
-...
+        if last["EMA9"] > last["EMA20"]:
+            score += 2
+        if last["EMA20"] > last["EMA50"]:
+            score += 2
+        if last["RET"] > 0:
+            score += 2
 
-━━━━━━━━━━━━━━━━━━━
-ROTATION
-...
-"""
+        if score >= 4:
+            results.append((t, score, last["c"]))
 
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-    )
+    df_res = pd.DataFrame(results, columns=["ticker", "score", "price"])
 
-    return r.choices[0].message.content
+    if df_res.empty:
+        return df_res
 
+    return df_res.sort_values("score", ascending=False).head(10)
 
-# =========================
-# 📤 DISCORD
-# =========================
-def send(msg):
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": f"```{msg}```"})
+# -----------------------------
+# REPORT
+# -----------------------------
+def build_report(df, breadth, snapshot):
+    regime = regime_text(breadth)
 
+    report = "🟫 TEA ELITE RECAP\n\n"
 
-# =========================
-# 🚀 MAIN
-# =========================
+    # SNAPSHOT
+    report += "🔹 SNAPSHOT\n"
+    report += f"Equities {snapshot['Equities']} | Oil {snapshot['Oil']} | Yields {snapshot['Yields']} | Dollar {snapshot['Dollar']} | Gold {snapshot['Gold']}\n\n"
+
+    # MACRO AUTO
+    report += "🌍 MACRO\n\n"
+
+    if regime == "bullish":
+        report += "Le marché montre une forte résilience et price un scénario favorable.\n\n"
+    elif regime == "neutre":
+        report += "Le marché reste en équilibre, sans direction claire.\n\n"
+    else:
+        report += "Le marché montre des signes de faiblesse et prudence.\n\n"
+
+    # FLOW
+    report += "⚡ CROSS-ASSET FLOW\n\n"
+    report += "Rotation en cours entre actifs selon le contexte macro.\n\n"
+
+    # INTERNALS
+    report += "📊 MARKET INTERNALS\n\n"
+    report += f"Breadth: {breadth}%\n"
+    report += f"Régime: {regime}\n\n"
+
+    # SETUPS
+    report += "🎯 TOP SETUPS\n\n"
+    for _, row in df.iterrows():
+        report += f"{row['ticker']} | Score: {row['score']} | Price: {round(row['price'],2)}\n"
+
+    # TAKEAWAY
+    report += "\n🎯 TAKEAWAY TEA\n\n"
+
+    if regime == "bullish":
+        report += "Momentum dominant → privilégier les pullbacks.\n"
+    elif regime == "neutre":
+        report += "Marché indécis → privilégier prudence et sélectivité.\n"
+    else:
+        report += "Risque élevé → éviter agressivité.\n"
+
+    return report
+
+# -----------------------------
+# DISCORD
+# -----------------------------
+def send_discord(msg):
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
-    try:
-        send("🔄 TEA BOT START")
+    tickers = load_sp500()
 
-        news = fetch_news()
-        market = fetch_market()
+    end_date = datetime.now() - timedelta(days=1)
+    start_date = end_date - timedelta(days=120)
 
-        sp500 = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")["Symbol"].tolist()
+    start = start_date.strftime("%Y-%m-%d")
+    end = end_date.strftime("%Y-%m-%d")
 
-        breadth = compute_breadth(sp500)
-        sectors = sector_rotation()
+    breadth = compute_breadth(tickers, start, end)
+    snapshot = get_snapshot()
+    df = scan_market()
 
-        score = compute_score(market, breadth)
-        reg = regime(score)
+    if df.empty:
+        message = "⚠️ Aucun setup valide aujourd’hui"
+    else:
+        message = build_report(df, breadth, snapshot)
 
-        recap = generate_recap(news, market, breadth, sectors, score, reg)
-
-        send(recap)
-
-    except Exception as e:
-        send(f"❌ ERREUR:\n{str(e)}")
-
+    send_discord(message)
 
 if __name__ == "__main__":
     main()
