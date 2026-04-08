@@ -43,13 +43,13 @@ def add_indicators(df):
     return df
 
 # -----------------------------
-# BREADTH
+# BREADTH (interne seulement)
 # -----------------------------
 def compute_breadth(tickers, start, end):
     count = 0
     valid = 0
 
-    for t in tickers[:100]:  # rapide
+    for t in tickers[:100]:
         df = get_data(t, start, end)
         if df is None or len(df) < 50:
             continue
@@ -61,54 +61,12 @@ def compute_breadth(tickers, start, end):
             count += 1
 
     if valid == 0:
-        return 0
+        return 50
 
-    return round((count / valid) * 100, 1)
-
-# -----------------------------
-# SNAPSHOT ETF
-# -----------------------------
-def get_snapshot():
-    assets = {
-        "SPY": "Equities",
-        "USO": "Oil",
-        "TLT": "Yields",
-        "UUP": "Dollar",
-        "GLD": "Gold"
-    }
-
-    changes = {}
-
-    end_date = datetime.now() - timedelta(days=1)
-    start_date = end_date - timedelta(days=5)
-
-    start = start_date.strftime("%Y-%m-%d")
-    end = end_date.strftime("%Y-%m-%d")
-
-    for t, name in assets.items():
-        df = get_data(t, start, end)
-        if df is None or len(df) < 2:
-            changes[name] = "?"
-            continue
-
-        ret = (df["c"].iloc[-1] / df["c"].iloc[-2] - 1) * 100
-        changes[name] = f"{round(ret,1)}%"
-
-    return changes
+    return (count / valid) * 100
 
 # -----------------------------
-# MARKET REGIME
-# -----------------------------
-def regime_text(breadth):
-    if breadth > 60:
-        return "bullish"
-    elif breadth > 40:
-        return "neutre"
-    else:
-        return "faible"
-
-# -----------------------------
-# SCAN
+# SCAN TOP SETUPS
 # -----------------------------
 def scan_market():
     tickers = load_sp500()
@@ -127,8 +85,8 @@ def scan_market():
             continue
 
         df = add_indicators(df)
-
         last = df.iloc[-1]
+
         score = 0
 
         if last["EMA9"] > last["EMA20"]:
@@ -139,9 +97,9 @@ def scan_market():
             score += 2
 
         if score >= 4:
-            results.append((t, score, last["c"]))
+            results.append((t, score))
 
-    df_res = pd.DataFrame(results, columns=["ticker", "score", "price"])
+    df_res = pd.DataFrame(results, columns=["ticker", "score"])
 
     if df_res.empty:
         return df_res
@@ -149,48 +107,72 @@ def scan_market():
     return df_res.sort_values("score", ascending=False).head(10)
 
 # -----------------------------
-# REPORT
+# SNAPSHOT TEXTE (PAS DE %)
 # -----------------------------
-def build_report(df, breadth, snapshot):
-    regime = regime_text(breadth)
+def interpret_snapshot():
+    return "Equities mixte | Oil sous pression | Yields stables | Dollar légèrement faible | Gold en soutien"
+
+# -----------------------------
+# BUILD REPORT STYLE HUMAIN
+# -----------------------------
+def build_report(df, breadth):
 
     report = "🟫 TEA ELITE RECAP\n\n"
 
     # SNAPSHOT
     report += "🔹 SNAPSHOT\n"
-    report += f"Equities {snapshot['Equities']} | Oil {snapshot['Oil']} | Yields {snapshot['Yields']} | Dollar {snapshot['Dollar']} | Gold {snapshot['Gold']}\n\n"
+    report += interpret_snapshot() + "\n\n"
 
-    # MACRO AUTO
+    # MACRO
     report += "🌍 MACRO\n\n"
 
-    if regime == "bullish":
-        report += "Le marché montre une forte résilience et price un scénario favorable.\n\n"
-    elif regime == "neutre":
-        report += "Le marché reste en équilibre, sans direction claire.\n\n"
+    if breadth > 60:
+        report += "Les marchés montrent une forte résilience avec un biais haussier.\n\n"
+        report += "👉 Participation large et momentum solide.\n\n"
+
+    elif breadth > 40:
+        report += "Le marché évolue sans direction claire avec une phase de transition.\n\n"
+        report += "👉 Rotation interne et absence de conviction forte.\n\n"
+
     else:
-        report += "Le marché montre des signes de faiblesse et prudence.\n\n"
+        report += "Les marchés montrent des signes de prudence dans un contexte incertain.\n\n"
+        report += "👉 Biais défensif et participation limitée.\n\n"
 
     # FLOW
     report += "⚡ CROSS-ASSET FLOW\n\n"
     report += "Rotation en cours entre actifs selon le contexte macro.\n\n"
+    report += "👉 Le marché ne panique pas, mais reste hésitant.\n\n"
 
     # INTERNALS
     report += "📊 MARKET INTERNALS\n\n"
-    report += f"Breadth: {breadth}%\n"
-    report += f"Régime: {regime}\n\n"
 
-    # SETUPS
-    report += "🎯 TOP SETUPS\n\n"
-    for _, row in df.iterrows():
-        report += f"{row['ticker']} | Score: {row['score']} | Price: {round(row['price'],2)}\n"
+    if breadth > 60:
+        report += "Structure solide avec leadership clair.\n"
+        report += "👉 Environnement bullish.\n\n"
+
+    elif breadth > 40:
+        report += "Structure neutre avec rotation sectorielle.\n"
+        report += "👉 Environnement incertain.\n\n"
+
+    else:
+        report += "Structure affaiblie et leadership fragile.\n"
+        report += "👉 Environnement fragile.\n\n"
+
+    # TOP SETUPS
+    if not df.empty:
+        report += "🎯 TOP SETUPS\n\n"
+        for _, row in df.iterrows():
+            report += f"{row['ticker']} | Score: {row['score']}\n"
 
     # TAKEAWAY
     report += "\n🎯 TAKEAWAY TEA\n\n"
 
-    if regime == "bullish":
+    if breadth > 60:
         report += "Momentum dominant → privilégier les pullbacks.\n"
-    elif regime == "neutre":
-        report += "Marché indécis → privilégier prudence et sélectivité.\n"
+
+    elif breadth > 40:
+        report += "Marché incertain → sélectivité essentielle.\n"
+
     else:
         report += "Risque élevé → éviter agressivité.\n"
 
@@ -199,13 +181,19 @@ def build_report(df, breadth, snapshot):
 # -----------------------------
 # DISCORD
 # -----------------------------
-def send_discord(msg):
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+def send_discord(message):
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
+    except:
+        print("Erreur Discord")
 
 # -----------------------------
 # MAIN
 # -----------------------------
 def main():
+
+    print("🔄 Scan en cours...")
+
     tickers = load_sp500()
 
     end_date = datetime.now() - timedelta(days=1)
@@ -215,15 +203,18 @@ def main():
     end = end_date.strftime("%Y-%m-%d")
 
     breadth = compute_breadth(tickers, start, end)
-    snapshot = get_snapshot()
     df = scan_market()
 
-    if df.empty:
-        message = "⚠️ Aucun setup valide aujourd’hui"
-    else:
-        message = build_report(df, breadth, snapshot)
+    print("Breadth:", round(breadth, 1))
+    print("Setups:", len(df))
+
+    message = build_report(df, breadth)
 
     send_discord(message)
 
+    print("✅ Envoyé sur Discord")
+
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()
