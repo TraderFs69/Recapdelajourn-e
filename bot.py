@@ -2,9 +2,16 @@ import pandas as pd
 import requests
 import os
 from datetime import datetime, timedelta
+from openai import OpenAI
 
+# -----------------------------
+# KEYS
+# -----------------------------
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -----------------------------
 # LOAD SP500
@@ -21,6 +28,7 @@ def get_data(ticker, start, end):
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
+
         if "results" not in data:
             return None
 
@@ -37,13 +45,10 @@ def get_data(ticker, start, end):
 # -----------------------------
 def add_indicators(df):
     df["EMA50"] = df["c"].ewm(span=50).mean()
-    df["EMA9"] = df["c"].ewm(span=9).mean()
-    df["EMA20"] = df["c"].ewm(span=20).mean()
-    df["RET"] = df["c"].pct_change()
     return df
 
 # -----------------------------
-# BREADTH (interne seulement)
+# BREADTH (interne)
 # -----------------------------
 def compute_breadth(tickers, start, end):
     count = 0
@@ -66,117 +71,81 @@ def compute_breadth(tickers, start, end):
     return (count / valid) * 100
 
 # -----------------------------
-# SCAN TOP SETUPS
-# -----------------------------
-def scan_market():
-    tickers = load_sp500()
-
-    end_date = datetime.now() - timedelta(days=1)
-    start_date = end_date - timedelta(days=120)
-
-    start = start_date.strftime("%Y-%m-%d")
-    end = end_date.strftime("%Y-%m-%d")
-
-    results = []
-
-    for t in tickers[:150]:
-        df = get_data(t, start, end)
-        if df is None or len(df) < 50:
-            continue
-
-        df = add_indicators(df)
-        last = df.iloc[-1]
-
-        score = 0
-
-        if last["EMA9"] > last["EMA20"]:
-            score += 2
-        if last["EMA20"] > last["EMA50"]:
-            score += 2
-        if last["RET"] > 0:
-            score += 2
-
-        if score >= 4:
-            results.append((t, score))
-
-    df_res = pd.DataFrame(results, columns=["ticker", "score"])
-
-    if df_res.empty:
-        return df_res
-
-    return df_res.sort_values("score", ascending=False).head(10)
-
-# -----------------------------
-# SNAPSHOT TEXTE (PAS DE %)
+# SNAPSHOT TEXTE
 # -----------------------------
 def interpret_snapshot():
     return "Equities mixte | Oil sous pression | Yields stables | Dollar légèrement faible | Gold en soutien"
 
 # -----------------------------
-# BUILD REPORT STYLE HUMAIN
+# GPT GENERATION
 # -----------------------------
-def build_report(df, breadth):
+def generate_market_text(snapshot, breadth):
 
-    report = "🟫 TEA ELITE RECAP\n\n"
+    prompt = f"""
+Tu es un analyste macro professionnel avec un style similaire à ZeroHedge.
 
-    # SNAPSHOT
-    report += "🔹 SNAPSHOT\n"
-    report += interpret_snapshot() + "\n\n"
+Écris un recap du marché en français avec ce format EXACT :
 
-    # MACRO
-    report += "🌍 MACRO\n\n"
+🟫 TEA ELITE RECAP
 
-    if breadth > 60:
-        report += "Les marchés montrent une forte résilience avec un biais haussier.\n\n"
-        report += "👉 Participation large et momentum solide.\n\n"
+🔹 SNAPSHOT
+{snapshot}
 
-    elif breadth > 40:
-        report += "Le marché évolue sans direction claire avec une phase de transition.\n\n"
-        report += "👉 Rotation interne et absence de conviction forte.\n\n"
+🌍 MACRO
+Analyse narrative du contexte du marché aujourd’hui
 
-    else:
-        report += "Les marchés montrent des signes de prudence dans un contexte incertain.\n\n"
-        report += "👉 Biais défensif et participation limitée.\n\n"
+👉 Trois dynamiques dominaient :
+- ...
+- ...
+- ...
 
-    # FLOW
-    report += "⚡ CROSS-ASSET FLOW\n\n"
-    report += "Rotation en cours entre actifs selon le contexte macro.\n\n"
-    report += "👉 Le marché ne panique pas, mais reste hésitant.\n\n"
+Conclusion macro
 
-    # INTERNALS
-    report += "📊 MARKET INTERNALS\n\n"
+⚡ CROSS-ASSET FLOW
+Analyse du comportement :
+- Oil
+- Dollar
+- Actions
+- Gold
 
-    if breadth > 60:
-        report += "Structure solide avec leadership clair.\n"
-        report += "👉 Environnement bullish.\n\n"
+Conclusion claire du comportement du marché
 
-    elif breadth > 40:
-        report += "Structure neutre avec rotation sectorielle.\n"
-        report += "👉 Environnement incertain.\n\n"
+📊 MARKET INTERNALS
+Analyse interne du marché :
+- structure
+- leadership
+- participation
 
-    else:
-        report += "Structure affaiblie et leadership fragile.\n"
-        report += "👉 Environnement fragile.\n\n"
+Conclusion sur la solidité du marché
 
-    # TOP SETUPS
-    if not df.empty:
-        report += "🎯 TOP SETUPS\n\n"
-        for _, row in df.iterrows():
-            report += f"{row['ticker']} | Score: {row['score']}\n"
+🎯 TAKEAWAY TEA
+2 idées fortes
 
-    # TAKEAWAY
-    report += "\n🎯 TAKEAWAY TEA\n\n"
+💡 Traduction :
+- ...
+- ...
 
-    if breadth > 60:
-        report += "Momentum dominant → privilégier les pullbacks.\n"
+➡️ Conclusion punchy
 
-    elif breadth > 40:
-        report += "Marché incertain → sélectivité essentielle.\n"
+IMPORTANT :
+- Texte fluide, humain, pas robot
+- Pas de chiffres techniques
+- Style narratif comme un article
+- Maximum 250 mots
+"""
 
-    else:
-        report += "Risque élevé → éviter agressivité.\n"
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5-3-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8
+        )
 
-    return report
+        return response.choices[0].message.content
+
+    except Exception as e:
+        print("Erreur GPT:", e)
+        return "⚠️ Erreur génération du recap"
 
 # -----------------------------
 # DISCORD
@@ -192,7 +161,7 @@ def send_discord(message):
 # -----------------------------
 def main():
 
-    print("🔄 Scan en cours...")
+    print("🔄 Génération du recap...")
 
     tickers = load_sp500()
 
@@ -203,18 +172,13 @@ def main():
     end = end_date.strftime("%Y-%m-%d")
 
     breadth = compute_breadth(tickers, start, end)
-    df = scan_market()
+    snapshot = interpret_snapshot()
 
-    print("Breadth:", round(breadth, 1))
-    print("Setups:", len(df))
+    text = generate_market_text(snapshot, breadth)
 
-    message = build_report(df, breadth)
+    send_discord(text)
 
-    send_discord(message)
+    print("✅ Recap envoyé")
 
-    print("✅ Envoyé sur Discord")
-
-if __name__ == "__main__":
-    main()
 if __name__ == "__main__":
     main()
