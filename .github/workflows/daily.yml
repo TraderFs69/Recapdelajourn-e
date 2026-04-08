@@ -2,7 +2,7 @@ name: TEA Elite Recap
 
 on:
   schedule:
-    - cron: "15 0 * * 2-6"
+    - cron: "20 0 * * 2-6"
   workflow_dispatch:
 
 jobs:
@@ -22,4 +22,5 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: python bot.py
