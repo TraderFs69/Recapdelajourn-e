@@ -1,32 +1,34 @@
 import pandas as pd
 import requests
 import os
+import time
 from datetime import datetime, timedelta
 from openai import OpenAI
 
 # -----------------------------
-# KEYS
+# CONFIG
 # -----------------------------
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI()
 
 # -----------------------------
 # LOAD SP500
 # -----------------------------
 def load_sp500():
-    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
-    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    try:
+        df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
+        return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    except:
+        return []
 
 # -----------------------------
-# FETCH DATA
+# FETCH DATA SAFE
 # -----------------------------
 def get_data(ticker, start, end):
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=200&apiKey={POLYGON_API_KEY}"
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=8)
         data = r.json()
 
         if "results" not in data:
@@ -35,31 +37,23 @@ def get_data(ticker, start, end):
         df = pd.DataFrame(data["results"])
         df["Date"] = pd.to_datetime(df["t"], unit="ms")
         df.set_index("Date", inplace=True)
-
         return df
+
     except:
         return None
 
 # -----------------------------
-# INDICATORS
-# -----------------------------
-def add_indicators(df):
-    df["EMA50"] = df["c"].ewm(span=50).mean()
-    return df
-
-# -----------------------------
-# BREADTH (interne)
+# BREADTH SAFE
 # -----------------------------
 def compute_breadth(tickers, start, end):
-    count = 0
-    valid = 0
+    count, valid = 0, 0
 
-    for t in tickers[:100]:
+    for t in tickers[:80]:  # rapide + safe
         df = get_data(t, start, end)
         if df is None or len(df) < 50:
             continue
 
-        df = add_indicators(df)
+        df["EMA50"] = df["c"].ewm(span=50).mean()
         valid += 1
 
         if df["c"].iloc[-1] > df["EMA50"].iloc[-1]:
@@ -71,20 +65,20 @@ def compute_breadth(tickers, start, end):
     return (count / valid) * 100
 
 # -----------------------------
-# SNAPSHOT TEXTE
+# SNAPSHOT TEXTE SIMPLE
 # -----------------------------
 def interpret_snapshot():
-    return "Equities mixte | Oil sous pression | Yields stables | Dollar légèrement faible | Gold en soutien"
+    return "Equities mixtes | Oil stable | Yields stables | Dollar neutre | Gold stable"
 
 # -----------------------------
-# GPT GENERATION
+# GPT GENERATION (RETRY)
 # -----------------------------
-def generate_market_text(snapshot, breadth):
+def generate_text(snapshot, breadth):
 
     prompt = f"""
-Tu es un analyste macro professionnel avec un style similaire à ZeroHedge.
+Tu es un analyste macro avec un style similaire à ZeroHedge.
 
-Écris un recap du marché en français avec ce format EXACT :
+Écris un recap en français EXACTEMENT dans ce format :
 
 🟫 TEA ELITE RECAP
 
@@ -92,7 +86,7 @@ Tu es un analyste macro professionnel avec un style similaire à ZeroHedge.
 {snapshot}
 
 🌍 MACRO
-Analyse narrative du contexte du marché aujourd’hui
+Analyse narrative
 
 👉 Trois dynamiques dominaient :
 - ...
@@ -102,24 +96,12 @@ Analyse narrative du contexte du marché aujourd’hui
 Conclusion macro
 
 ⚡ CROSS-ASSET FLOW
-Analyse du comportement :
-- Oil
-- Dollar
-- Actions
-- Gold
-
-Conclusion claire du comportement du marché
+Analyse narrative
 
 📊 MARKET INTERNALS
-Analyse interne du marché :
-- structure
-- leadership
-- participation
-
-Conclusion sur la solidité du marché
+Analyse narrative
 
 🎯 TAKEAWAY TEA
-2 idées fortes
 
 💡 Traduction :
 - ...
@@ -128,31 +110,63 @@ Conclusion sur la solidité du marché
 ➡️ Conclusion punchy
 
 IMPORTANT :
-- Texte fluide, humain, pas robot
-- Pas de chiffres techniques
-- Style narratif comme un article
-- Maximum 250 mots
+- Style humain
+- Pas robot
+- Pas de chiffres
+- 150-250 mots
 """
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5-3-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.8
-        )
+    for i in range(3):  # retry x3
+        try:
+            response = client.responses.create(
+                model="gpt-5-3-instant",
+                input=prompt
+            )
 
-        return response.choices[0].message.content
+            text = response.output_text
 
-    except Exception as e:
-        print("Erreur GPT:", e)
-        return "⚠️ Erreur génération du recap"
+            if text and len(text) > 100:
+                return text
+
+        except Exception as e:
+            print(f"Erreur GPT tentative {i+1}:", e)
+            time.sleep(2)
+
+    # 🔥 FALLBACK SI GPT FAIL
+    return fallback_text(snapshot, breadth)
 
 # -----------------------------
-# DISCORD
+# FALLBACK TEXTE
 # -----------------------------
-def send_discord(message):
+def fallback_text(snapshot, breadth):
+
+    base = "🟫 TEA ELITE RECAP\n\n"
+    base += "🔹 SNAPSHOT\n" + snapshot + "\n\n"
+
+    base += "🌍 MACRO\n\n"
+
+    if breadth > 60:
+        base += "Le marché reste solide avec une participation large.\n\n"
+    elif breadth > 40:
+        base += "Le marché évolue sans direction claire.\n\n"
+    else:
+        base += "Le marché montre des signes de prudence.\n\n"
+
+    base += "⚡ CROSS-ASSET FLOW\n\nRotation entre actifs.\n\n"
+
+    base += "📊 MARKET INTERNALS\n\nStructure fragile.\n\n"
+
+    base += "🎯 TAKEAWAY TEA\n\n"
+    base += "Marché incertain → prudence.\n"
+
+    return base
+
+# -----------------------------
+# DISCORD SAFE
+# -----------------------------
+def send_discord(msg):
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
     except:
         print("Erreur Discord")
 
@@ -161,7 +175,7 @@ def send_discord(message):
 # -----------------------------
 def main():
 
-    print("🔄 Génération du recap...")
+    print("🚀 START BOT")
 
     tickers = load_sp500()
 
@@ -174,11 +188,16 @@ def main():
     breadth = compute_breadth(tickers, start, end)
     snapshot = interpret_snapshot()
 
-    text = generate_market_text(snapshot, breadth)
+    print("Breadth:", round(breadth,1))
+
+    text = generate_text(snapshot, breadth)
+
+    if not text or len(text) < 50:
+        text = fallback_text(snapshot, breadth)
 
     send_discord(text)
 
-    print("✅ Recap envoyé")
+    print("✅ DONE")
 
 if __name__ == "__main__":
     main()
